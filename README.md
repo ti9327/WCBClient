@@ -94,7 +94,7 @@ void loop() {
 
 ### Forward Maestro servo commands wirelessly — unicast
 
-Send to one specific WCB and serial port. No special configuration needed on the receiving WCB.
+Send to one specific WCB and serial port. The receiving WCB writes the bytes directly to the requested port — **no `?KYBER,REMOTE` configuration is required**. The `?KYBER,REMOTE` flag is only checked on the broadcast path; unicast bypasses it entirely.
 
 ```cpp
 #include <WCBClient.h>
@@ -200,6 +200,109 @@ MiniMaestro maestro(stream, Maestro::noResetPin, deviceNumber);
 
 ---
 
+## Callbacks
+
+Both callbacks are optional. If you only need to send commands and never receive them, you can omit both entirely.
+
+### Command callback
+
+Called whenever a text command arrives that is addressed to your device or broadcast to all devices.
+
+```cpp
+void onCommandReceived(uint8_t senderID, const char* command) {
+    // senderID : which WCB sent the command (1–20)
+    // command  : the command string, clean — checksum already stripped
+}
+```
+
+**`senderID`** is the WCB number of the sender. Use this to respond differently depending on who sent the command, or to log which WCB triggered an action.
+
+**`command`** is a null-terminated C string containing the exact command text. If checksums are enabled, the CRC32 suffix has already been verified and removed before your callback is called — you always receive the clean command.
+
+```cpp
+void onCommandReceived(uint8_t senderID, const char* command) {
+    Serial.printf("From WCB%d: %s\n", senderID, command);
+
+    if (strcmp(command, ":TRIGGER") == 0) {
+        fireEffect();
+    } else if (strncmp(command, ":VOL", 4) == 0) {
+        int vol = atoi(command + 4);   // e.g. ":VOL75" → 75
+        setVolume(vol);
+    }
+}
+```
+
+### Status callback
+
+Called whenever a WCB transitions between online and offline. A WCB is considered offline after approximately 30 seconds of missed heartbeats (3 × the 10-second heartbeat interval, matching WCB firmware defaults).
+
+```cpp
+void onStatusChanged(uint8_t wcbID, bool online) {
+    // wcbID  : which WCB changed state (1–WCB_QUANTITY)
+    // online : true = just came online, false = just went offline
+}
+```
+
+**`wcbID`** is the WCB number that changed state.
+
+**`online`** is `true` when the WCB just sent its first heartbeat after being offline (or on startup), and `false` when heartbeats have stopped arriving for ~30 seconds.
+
+```cpp
+void onStatusChanged(uint8_t wcbID, bool online) {
+    if (online) {
+        Serial.printf("WCB%d is online\n", wcbID);
+        // Re-send initial state, sync positions, etc.
+    } else {
+        Serial.printf("WCB%d went offline\n", wcbID);
+        // Stop sending commands to this WCB, trigger a warning, etc.
+    }
+}
+```
+
+### Registering callbacks
+
+**In the constructor** — both are optional positional arguments. Pass `nullptr` to skip one:
+
+```cpp
+// Command callback only
+WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
+              onCommandReceived);
+
+// Status callback only
+WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
+              nullptr, onStatusChanged);
+
+// Both
+WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
+              onCommandReceived, onStatusChanged);
+```
+
+**After construction** — use these methods any time, including after `begin()`:
+
+```cpp
+wcb.onCommand(onCommandReceived);
+wcb.onStatusChange(onStatusChanged);
+```
+
+This is useful when your callback logic depends on objects that are not yet initialised at global-scope construction time.
+
+### Lambda callbacks
+
+Both callbacks also accept lambdas for compact inline definitions:
+
+```cpp
+WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
+    [](uint8_t sender, const char* cmd) {
+        Serial.printf("From WCB%d: %s\n", sender, cmd);
+    },
+    [](uint8_t id, bool online) {
+        Serial.printf("WCB%d %s\n", id, online ? "online" : "offline");
+    }
+);
+```
+
+---
+
 ## WCBStream Modes
 
 ### Broadcast mode — recommended for servo passthrough
@@ -225,7 +328,9 @@ Requires `?KYBER,REMOTE,S<port>` configured on each WCB that has a Maestro wired
 WCBStream stream(2, 1);   // → WCB2, serial port 1
 ```
 
-Sends raw bytes directly to one specific WCB's serial port using `sendRaw()`. The receiving WCB writes the bytes to that port without any special Kyber configuration — it just works. Unicast is perfectly acceptable for low-frequency operations like triggering a `RestartScript` on a known target, but for continuous servo streaming broadcast will give noticeably better performance. Use unicast when:
+Sends raw bytes directly to one specific WCB's serial port using `sendRaw()`. The receiving WCB writes the bytes straight to the requested port — **`?KYBER,REMOTE` is not required**. The Kyber Remote flag is only checked on the broadcast path (target 98); the unicast path (target 97) ignores it entirely and writes unconditionally to whatever port number is in the packet.
+
+Unicast is perfectly acceptable for low-frequency operations like triggering a `RestartScript` on a known target, but for continuous servo streaming broadcast will give noticeably better performance. Use unicast when:
 
 - You need to target one specific WCB:port and broadcast is not an option
 - You are sending infrequent commands (script triggers, one-shot moves) rather than a continuous stream
