@@ -39,6 +39,71 @@ This library lets any ESP32 — a Kyber controller, a custom prop brain, a stage
 
 ---
 
+## Limitations & Coexistence (WiFi / other ESP-NOW)
+
+This library takes over the ESP32's radio to join the WCB ESP-NOW network. Read
+this before combining it with WiFi or another ESP-NOW stack.
+
+### It takes over WiFi
+
+`begin()` calls `WiFi.mode(WIFI_STA)` followed by `WiFi.disconnect()`. **It will
+drop any existing connection to a WiFi router/AP**, and ESP-NOW timing assumes no
+AP association. You generally **cannot run a normal WiFi workload (web server,
+MQTT, cloud, HTTP/OTA-over-WiFi) on the same ESP32** while using this library.
+
+If you genuinely need both, you must keep everything on a **single fixed WiFi
+channel** (see below) and accept the MAC override — in practice it's far simpler
+to dedicate this ESP32 to the WCB network and use a second board for WiFi tasks.
+
+### Shared radio channel
+
+ESP-NOW operates on whatever channel the WiFi radio is currently on. **Every WCB
+and every client must be on the same channel.** If something in your sketch
+associates with an access point, the channel is locked to that AP's channel and
+ESP-NOW only works if all peers happen to be on it too. Mismatched channels =
+packets silently dropped, no error.
+
+### The WiFi MAC is overwritten
+
+`begin()` calls `esp_wifi_set_mac()` to force the station MAC to the WCB scheme
+`02:oct2:oct3:00:00:<deviceID>` so the WCBs recognize this device as a peer.
+Consequences:
+
+- Anything that depends on the factory/default MAC (licensing, MAC-based
+  device identity, router MAC filtering, DHCP reservations) **will not see the
+  real MAC**.
+- **Two devices with the same `deviceID` + `oct2`/`oct3` get an identical MAC.**
+  Never reuse a device ID on the same network — use the special slot (`20`) for
+  an extra out-of-band device.
+
+### Only one ESP-NOW stack, one instance
+
+- ESP-NOW is global ESP-IDF state. `begin()` calls `esp_now_init()` and
+  registers **the** single receive callback via `esp_now_register_recv_cb()`.
+  **You cannot run a second, independent ESP-NOW network/library alongside this
+  one** — whichever registers its receive callback last wins, and the other
+  stack stops receiving.
+- **Only one `WCB_Client` instance is supported per sketch** (it's a singleton).
+  Declare it once at global scope.
+
+### WiFi power save
+
+If you do bring up WiFi for any reason, modem sleep can cause this device to
+miss ESP-NOW packets. Disable it with `esp_wifi_set_ps(WIFI_PS_NONE)` (or
+`WiFi.setSleep(false)`) after `begin()`.
+
+### Quick reference
+
+| If you need… | Result with this library |
+|---|---|
+| WCB ESP-NOW only | ✅ Intended use — works out of the box |
+| WiFi STA + WCB on the same board | ⚠️ Only if all peers share the AP's fixed channel; `begin()` still disconnects WiFi |
+| A second, separate ESP-NOW network | ❌ Not supported — single global receive callback |
+| Multiple `WCB_Client` objects | ❌ Not supported — singleton |
+| Factory MAC preserved | ❌ MAC is overwritten by design |
+
+---
+
 ## Network Credentials
 
 All devices on the same WCB network must share four values. Find them by querying any WCB over serial or using the WCB Config Tool:
