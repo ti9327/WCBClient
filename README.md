@@ -446,6 +446,43 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 
 ---
 
+## Changelog
+
+### 1.1.0
+
+Reliability fixes for the ETM acknowledgement layer. No API changes — existing
+sketches compile and run unchanged.
+
+- **Fixed: duplicate sequence numbers under concurrent sends.** The per-command
+  sequence counter is now atomic. It is incremented from both the main loop
+  (`send()` / `broadcast()`) and the ESP-NOW receive callback (when a command
+  callback replies with `send()`). A non-atomic increment could hand the same
+  sequence number to two packets, causing the receiving WCB's duplicate
+  detection to silently drop one of them.
+- **Fixed: heavy broadcasting could starve unicast ACK tracking.** Broadcasts
+  are fire-and-forget and are no longer recorded in the small in-flight ACK
+  table (`WCB_PENDING_MAX` = 3 slots). Previously, broadcasting filled all
+  tracking slots within seconds and left no room to match unicast ACKs.
+- **Improved: stale ACK-pending slots are reclaimed automatically.** A unicast
+  whose ACK never arrives no longer holds its slot indefinitely; slots older
+  than 1 second are freed for reuse. (Reclaim only — the library does not
+  retransmit; ESP-NOW unicast already retries at the MAC layer.)
+- **Fixed: pending-table command copy is now always null-terminated.**
+
+### 1.0.0
+
+Initial release.
+
+- Join a WCB ESP-NOW network as a first-class peer
+- Unicast and broadcast text commands (`send()` / `broadcast()`)
+- Raw byte forwarding to Pololu Maestro controllers via `WCBStream`
+  (unicast and Kyber broadcast)
+- UART monitors (`monitorRaw()` / `monitorSerial()`) for transparent passthrough
+- ETM heartbeat tracking with online/offline status callbacks
+- Optional CRC32 checksums matching WCB firmware
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE)
