@@ -74,13 +74,31 @@ constexpr uint8_t broadcast = 0;
 // Library limits
 // ─────────────────────────────────────────────────────────────────────────────
 #define WCB_MAX_BOARDS   20   // Maximum WCB IDs supported (1–20)
-#define WCB_PENDING_MAX   3   // In-flight COMMAND slots tracked for ACK.
-                              // Keep small — ESP32 RAM is limited and ESP-NOW
-                              // is fast enough that 3 outstanding messages is
-                              // plenty for typical use.
+#define WCB_PENDING_MAX  10   // In-flight COMMAND slots tracked for ACK.
+                              // Matches the WCB firmware's ETM_PENDING_MAX so
+                              // client ensured traffic has the same depth as
+                              // WCB-to-WCB ETM. When full, the oldest slot is
+                              // evicted (see _findFreePending) — same policy as
+                              // the firmware — rather than dropping the new send.
 #define WCB_SPECIAL_ID   20   // Device ID 20 is an out-of-band slot for third-party
                               // devices that don't consume a WCB slot in the system.
                               // Requires specialPeerEnabled = true on the WCBs.
+
+// ── Ensured-delivery (ETM) retransmit tuning ─────────────────────────────────
+// Applies ONLY to send()/broadcast() calls made with ensured=true. These values
+// MIRROR the WCB firmware's own ETM retry engine (processETMAcksAndRetries) so
+// client-originated ensured traffic behaves identically to WCB-to-WCB ETM:
+//   • initial send goes out as-is (unicast, or a single broadcast),
+//   • then PER-BOARD UNICAST retries (reusing the original sequence number) to
+//     each expected board that hasn't ACK'd, every ETM_RETRY_INTERVAL_MS,
+//   • up to ETM_MAX_RETRIES per board; a board that drops offline is dropped
+//     from the expected set rather than retried forever.
+// Matches the firmware defaults (etmTimeoutMs = 500, 3 retries). Default
+// (ensured=false) sends are single-transmit with NO retry of any kind —
+// fire-and-forget for broadcast, send-once for unicast. Guaranteed delivery
+// comes ONLY from ETM (ensured=true); there is no other reliability layer.
+#define ETM_RETRY_INTERVAL_MS  500  // ms between retry passes (matches firmware etmTimeoutMs)
+#define ETM_MAX_RETRIES         3   // per-board unicast retries before giving up (matches firmware)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Packet structs
@@ -133,17 +151,25 @@ struct WCBBoardStatus {
 };
 
 // Tracks an in-flight COMMAND that is waiting for an ACK.
-// When an ACK arrives with a matching seqNum the slot is cleared.
-// If no ACK arrives the slot eventually gets reused (oldest evicted).
-// The library does not auto-retry — that is handled by WCB firmware for
-// WCB-to-WCB traffic. For device-to-WCB, the pending table is informational.
+// When an ACK arrives with a matching seqNum the slot is updated; a unicast
+// slot is freed on its target's ACK, a broadcast slot when all expected
+// recipients have ACK'd.
+//
+// Best-effort sends (ensured=false): the slot is informational only — there
+// is NO retransmit of any kind (a best-effort unicast is sent once; best-effort
+// broadcasts aren't even tracked).  ENSURED sends (ensured=true) ARE
+// retransmitted by update() via the ETM ACK/retry below until complete.
 struct WCBPending {
     bool          active;                     // true = this slot is in use
     uint16_t      seqNum;                     // sequence number of the tracked packet
-    char          command[200];               // copy of the command string (for debug)
-    unsigned long sentMs;                     // millis() when the packet was sent
+    char          command[200];               // copy of the command string (resent on retry)
+    unsigned long sentMs;                     // millis() of the last (re)transmit
     uint8_t       targetID;                   // target WCB ID (or WCB_TARGET_BROADCAST)
     bool          ackReceived[WCB_MAX_BOARDS];// which boards have ACK'd this sequence
+    // ── Ensured-delivery state (only meaningful when `ensured` is true) ──
+    bool          ensured;                    // retransmit until every expected board ACKs
+    bool          expected[WCB_MAX_BOARDS];   // boards that must ACK (snapshot of online set at send)
+    uint8_t       retryCount[WCB_MAX_BOARDS]; // PER-BOARD unicast retries done (mirrors firmware)
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -222,16 +248,30 @@ public:
     // target_wcb : WCB number to address (1–WCB_MAX_BOARDS)
     // command    : null-terminated command string (max ~188 chars with checksum,
     //              200 chars without — matching ?ETM,CHKSM setting on WCBs)
-    // Returns true if ESP-NOW accepted the packet for transmission.
-    // Note: true does not guarantee delivery — use isOnline() before sending
-    // to a board you know needs to be reachable.
-    bool send(uint8_t target_wcb, const char* command);
+    // ensured    : true (default) → application-layer ETM ensured delivery:
+    //              retransmit (reusing the sequence number) until the target
+    //              ACKs at the ETM layer, up to ETM_MAX_RETRIES. This matches
+    //              the WCB firmware, which sends with ETM ON by default — so
+    //              client commands are reliable by default, just like WCB-to-WCB.
+    //              false → sent ONCE, no retry. Use for high-rate traffic where
+    //              the next update supersedes a lost one (you generally want the
+    //              raw streaming helpers — sendRaw/WCBStream — for that instead).
+    // Returns true if ESP-NOW accepted the (first) packet for transmission.
+    bool send(uint8_t target_wcb, const char* command, bool ensured = true);
 
     // Broadcast a text command to ALL WCBs on the network simultaneously.
-    // Sends one ESP-NOW packet to the shared broadcast MAC; every WCB on the
-    // network receives and processes it.
-    // Returns true if ESP-NOW accepted the packet for transmission.
-    bool broadcast(const char* command);
+    // Sends one ESP-NOW packet to the shared broadcast MAC; every WCB receives it.
+    // ensured : true (default) → ENSURED broadcast: the packet is retransmitted
+    //           (per-board unicast, reusing the sequence number) until every
+    //           board that was online at send time has ACK'd at the ETM layer
+    //           (or dropped offline), up to ETM_MAX_RETRIES. Mirrors the WCB
+    //           firmware, which ensures broadcasts to every online board when
+    //           ETM is on — so "command all boards" actions land by default.
+    //           false → fire-and-forget (no ACK tracking, no retry). Correct for
+    //           periodic telemetry / status spam where reliability isn't needed
+    //           and you don't want to spend a pending slot + retransmits on it.
+    // Returns true if ESP-NOW accepted the (first) packet for transmission.
+    bool broadcast(const char* command, bool ensured = true);
 
     // Send raw binary data to a specific WCB for forwarding out one of its
     // serial ports. Use this to deliver Pololu / Maestro binary protocol packets
@@ -444,9 +484,22 @@ private:
     void _sendAck(uint8_t targetID, uint16_t seqNum);
 
     // Build and send a COMMAND packet to targetID (or broadcast if 0).
-    // Appends CRC32 checksum when _checksumEnabled is true.
-    // Records the packet in the pending table for ACK tracking.
-    bool _sendPacket(uint8_t targetID, const char* command);
+    // Allocates a sequence number, optionally records the packet in the pending
+    // table (always for ensured sends and unicast; never for best-effort
+    // broadcast), snapshots the expected-recipient set for ensured sends, then
+    // transmits via _transmit().
+    bool _sendPacket(uint8_t targetID, const char* command, bool ensured);
+
+    // Build + transmit a COMMAND packet with an EXPLICIT sequence number — no
+    // counter increment, no pending bookkeeping. Used for the initial send and
+    // for ensured retransmits, which MUST reuse the original seq so receivers
+    // dedup it and returning ACKs still match the pending slot. Appends the
+    // CRC32 suffix when _checksumEnabled is true.
+    bool _transmit(uint8_t targetID, const char* command, uint16_t seqNum);
+
+    // True when an ensured packet is fully delivered: every board in p.expected[]
+    // has either ACK'd or dropped offline (so we no longer wait on it).
+    bool _ensuredComplete(const WCBPending& p) const;
 
     // Scan _boards[] and mark any WCB as offline if its last heartbeat is older
     // than (heartbeatInterval * missedBeforeOffline) seconds.

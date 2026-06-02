@@ -224,8 +224,8 @@ void loop() {
 | `WCB_Client(oct2, oct3, password, quantity, deviceID, [cmdCb], [statusCb])` | Constructor. `deviceID` must match your WCB system (1–`quantity` for a standard slot, or `20` for the out-of-band special slot). |
 | `begin()` | Initialize WiFi and ESP-NOW, set custom MAC, register peers. Call once from `setup()`. |
 | `update()` | Call every `loop()`. Drives heartbeats, offline detection, and WCBStream flushing. |
-| `send(wcbID, command)` | Unicast a text command to one WCB. |
-| `broadcast(command)` | Broadcast a text command to all WCBs simultaneously. |
+| `send(wcbID, command, [ensured=true])` | Unicast a text command to one WCB. Ensured by default (retransmits until ACK'd, like WCB-to-WCB ETM); pass `false` for fire-and-forget. |
+| `broadcast(command, [ensured=true])` | Broadcast a text command to all WCBs simultaneously. Ensured by default (retransmits per-board until every online board ACKs); pass `false` for fire-and-forget telemetry. |
 | `sendRaw(wcbID, port, data, len)` | Unicast raw bytes to a specific WCB's serial port. |
 | `sendKyber(data, len)` | Broadcast raw bytes to all WCBs — any with `?KYBER,REMOTE` will forward to their Maestro. |
 | `monitorRaw(serial, target, port, [gap_ms])` | Watch a UART; flush buffered bytes via `sendRaw()` or `sendKyber()` (pass `broadcast` as target) when silent for `gap_ms`. |
@@ -448,6 +448,37 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 
 ## Changelog
 
+### 1.2.0
+
+Adds **ensured delivery**, and makes it the default for text commands so the
+library is **reliable by default** — matching the WCB firmware, which transmits
+with ETM ON by default. (Earlier 1.x releases never retransmitted, so
+client→WCB text was always best-effort regardless of the WCBs' ETM setting.)
+
+- **`send()` and `broadcast()` now default to `ensured=true`.** A lost packet or
+  ACK is retransmitted instead of silently missed, just like WCB-to-WCB ETM.
+  Mirrors the firmware's retry engine: after the initial send, the packet is
+  retried as a **per-board unicast** (reusing the original sequence number, so
+  receivers dedup it) to each expected board that hasn't ACK'd — up to
+  `ETM_MAX_RETRIES` per board. For a unicast the expected recipient is the
+  target; for a broadcast it's every board that was online at send time. A board
+  that drops offline mid-flight is dropped from the expected set rather than
+  retried forever.
+- **Opt out with `ensured=false`** for high-rate telemetry / status spam where
+  the next update supersedes a lost one — it avoids spending a pending slot and
+  airtime per send. (For binary streaming use the raw helpers `sendRaw()` /
+  `sendKyber()` / `WCBStream`, which are best-effort and unaffected by this
+  default — exactly as the firmware keeps PWM/servo streaming out of ETM.)
+- Tuning via `ETM_RETRY_INTERVAL_MS` (default 500 ms) and `ETM_MAX_RETRIES`
+  (default 3) — matched to the firmware's `etmTimeoutMs` and retry count.
+- The in-flight tracking table grew from 3 to **10 slots** (`WCB_PENDING_MAX`),
+  matching the firmware's `ETM_PENDING_MAX`. When full it now evicts the oldest
+  entry rather than dropping the new send, so ensured commands always get tracked.
+
+**Upgrade note:** if you have a sketch that calls `broadcast()` or `send()` at a
+high rate for telemetry, add `, false` to those calls to keep them best-effort.
+Discrete commands need no change — they just became reliable.
+
 ### 1.1.0
 
 Reliability fixes for the ETM acknowledgement layer. No API changes — existing
@@ -465,8 +496,9 @@ sketches compile and run unchanged.
   tracking slots within seconds and left no room to match unicast ACKs.
 - **Improved: stale ACK-pending slots are reclaimed automatically.** A unicast
   whose ACK never arrives no longer holds its slot indefinitely; slots older
-  than 1 second are freed for reuse. (Reclaim only — the library does not
-  retransmit; ESP-NOW unicast already retries at the MAC layer.)
+  than 1 second are freed for reuse. (Reclaim only — at 1.1.0 the library does
+  not retransmit at all; a lost packet is simply missed. Application-layer ETM
+  retransmission arrives in 1.2.0.)
 - **Fixed: pending-table command copy is now always null-terminated.**
 
 ### 1.0.0
