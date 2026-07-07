@@ -149,6 +149,7 @@ void WCB_Client::update() {
     _checkOfflineBoards();
     _processMonitors();
     _processFragJob();   // drain a pending fragmented send, one chunk per tick
+    _wdpTick();          // WDP device-identity advert cadence (boot burst + periodic)
 
     // Service the pending table.
     for (int i = 0; i < WCB_PENDING_MAX; i++) {
@@ -813,6 +814,95 @@ void WCB_Client::_sendHeartbeat() {
     hb.structSequenceNumber  = 0;         // Heartbeats don't use sequence numbers
 
     esp_now_send(_broadcastMAC, (uint8_t*)&hb, sizeof(hb));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WDP device-identity advert
+//
+// Broadcasts this device's identity (set via setIdentity) on the mesh so every
+// WCB discovers it through its Wireless Discovery Protocol neighbor table. The
+// wire format MUST match the WCB firmware's WCB_WDP: a 2-byte header (magic 'W',
+// proto 0x01) then [type][len][value] TLVs, carried raw in the ETM packet's
+// structCommand with structPacketType = WCB_PACKET_WDP. No CRC — WDP carries TLV
+// bytes, not a text command.
+// ─────────────────────────────────────────────────────────────────────────────
+#define WCB_WDP_MAGIC        'W'
+#define WCB_WDP_PROTO        0x01
+#define WCB_WDP_TLV_END      0x00
+#define WCB_WDP_TLV_FWVER    0x03   // string (shared with WCB adverts)
+#define WCB_WDP_TLV_DEVTYPE  0x0B   // string — canonical device type name
+#define WCB_WDP_TLV_HWREV    0x0C   // string — hardware revision
+#define WCB_WDP_TLV_CAPTAGS  0x0D   // string — space-separated capability tags
+
+// Append one TLV; returns the new offset (unchanged if it wouldn't fit).
+static int wcbPutTLV(uint8_t* buf, int o, int max, uint8_t type,
+                     const uint8_t* val, int len) {
+    if (len < 0)   len = 0;
+    if (len > 255) len = 255;
+    if (o + 2 + len > max) return o;   // no room — skip this TLV
+    buf[o++] = type;
+    buf[o++] = (uint8_t)len;
+    for (int i = 0; i < len; i++) buf[o++] = val[i];
+    return o;
+}
+
+void WCB_Client::setIdentity(const char* type, const char* fw,
+                             const char* hwRev, const char* caps) {
+    strncpy(_wdpType,  type  ? type  : "", sizeof(_wdpType)  - 1);  _wdpType[sizeof(_wdpType)  - 1] = '\0';
+    strncpy(_wdpFw,    fw    ? fw    : "", sizeof(_wdpFw)    - 1);  _wdpFw[sizeof(_wdpFw)      - 1] = '\0';
+    strncpy(_wdpHwRev, hwRev ? hwRev : "", sizeof(_wdpHwRev) - 1);  _wdpHwRev[sizeof(_wdpHwRev) - 1] = '\0';
+    strncpy(_wdpCaps,  caps  ? caps  : "", sizeof(_wdpCaps)  - 1);  _wdpCaps[sizeof(_wdpCaps)  - 1] = '\0';
+
+    // Arm the cadence so the new identity goes out promptly (short boot burst),
+    // then settles to a staggered periodic backstop. Works whether called before
+    // or after begin(): the send happens from update() once ESP-NOW is up.
+    _wdpBootLeft     = (_wdpType[0]) ? 3 : 0;
+    _wdpNextBootMs   = millis() + 300;
+    _wdpNextAdvertMs = millis() + 60000UL + (unsigned long)((_deviceID % 16) * 500);
+
+    if (_wdpType[0])
+        Serial.printf("[WCB_Client] WDP identity set: type=\"%s\" fw=\"%s\"\n", _wdpType, _wdpFw);
+}
+
+int WCB_Client::_buildWdpPayload(uint8_t* buf, int max) {
+    int o = 0;
+    if (max < 3) return 0;
+    buf[o++] = WCB_WDP_MAGIC;
+    buf[o++] = WCB_WDP_PROTO;
+    o = wcbPutTLV(buf, o, max, WCB_WDP_TLV_DEVTYPE, (const uint8_t*)_wdpType, strlen(_wdpType));
+    if (_wdpFw[0])    o = wcbPutTLV(buf, o, max, WCB_WDP_TLV_FWVER,   (const uint8_t*)_wdpFw,    strlen(_wdpFw));
+    if (_wdpHwRev[0]) o = wcbPutTLV(buf, o, max, WCB_WDP_TLV_HWREV,   (const uint8_t*)_wdpHwRev, strlen(_wdpHwRev));
+    if (_wdpCaps[0])  o = wcbPutTLV(buf, o, max, WCB_WDP_TLV_CAPTAGS, (const uint8_t*)_wdpCaps,  strlen(_wdpCaps));
+    if (o < max) buf[o++] = WCB_WDP_TLV_END;
+    return o;
+}
+
+void WCB_Client::_sendWdpAdvert() {
+    wcb_packet_etm_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    strncpy(pkt.structPassword, _password, sizeof(pkt.structPassword) - 1);
+    snprintf(pkt.structSenderID, sizeof(pkt.structSenderID), "%d", _deviceID);
+    snprintf(pkt.structTargetID, sizeof(pkt.structTargetID), "0");   // 0 = broadcast
+    pkt.structCommandIncluded = 1;
+    // Raw TLV bytes (may contain 0x00) go straight into structCommand — no CRC.
+    _buildWdpPayload((uint8_t*)pkt.structCommand, sizeof(pkt.structCommand));
+    pkt.structPacketType     = WCB_PACKET_WDP;
+    pkt.structSequenceNumber = 0;
+    esp_now_send(_broadcastMAC, (uint8_t*)&pkt, sizeof(pkt));
+}
+
+void WCB_Client::_wdpTick() {
+    if (!_started || !_wdpType[0]) return;   // not running, or nothing to advertise
+    unsigned long now = millis();
+    if (_wdpBootLeft > 0 && now >= _wdpNextBootMs) {
+        _sendWdpAdvert();
+        _wdpBootLeft--;
+        _wdpNextBootMs = now + 1300;
+    }
+    if ((long)(now - _wdpNextAdvertMs) >= 0) {   // rollover-safe
+        _sendWdpAdvert();
+        _wdpNextAdvertMs = now + 60000UL;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

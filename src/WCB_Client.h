@@ -49,6 +49,7 @@ class WCBStream;
 #define WCB_PACKET_COMMAND    0   // A text command (or raw binary) directed at a target
 #define WCB_PACKET_ACK        1   // Acknowledgement that a COMMAND was received
 #define WCB_PACKET_HEARTBEAT  2   // Periodic keepalive broadcast — no command payload
+#define WCB_PACKET_WDP       12   // WDP device-identity advert (matches firmware PACKET_TYPE_WDP)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Special target IDs
@@ -492,6 +493,31 @@ public:
     // Note: enabling checksum reduces the usable command length from 200 to ~188 chars.
     void setChecksum(bool enabled);
 
+    // ── Device identity (WDP discovery) ────────────────────────────────────
+
+    // Advertise this device's identity on the WCB mesh via WDP so every WCB
+    // discovers it automatically — it then appears in ?WDP,LIST / the config
+    // tool as a named device with its firmware version, no manual labeling.
+    //
+    // This is the mesh twin of the serial "WDP-DA" device-announce model; a
+    // device describes itself the same way whether it's wired to a WCB port or
+    // joined over ESP-NOW.
+    //   type : canonical device name (e.g. "NaviCore", "Flthy HP Controller").
+    //          Use a name from the shared WCB device vocabulary. REQUIRED —
+    //          a null/empty type disables WDP advertising.
+    //   fw   : this device's firmware version string.
+    //   hwRev: optional hardware revision ("revB"); pass nullptr to omit.
+    //   caps : optional space-separated capability tags ("hp.servo hp.led");
+    //          pass nullptr to omit.
+    //
+    // Call from setup(), before OR after begin(). The advert goes out as a short
+    // boot burst and is then re-broadcast periodically (~60 s, staggered per
+    // device_id) from update() — so keep calling update() (you must anyway).
+    // Requires ETM active on the WCBs (WDP rides the ETM broadcast layer, which
+    // is the WCB factory default).
+    void setIdentity(const char* type, const char* fw,
+                     const char* hwRev = nullptr, const char* caps = nullptr);
+
 
 private:
 
@@ -530,6 +556,17 @@ private:
     uint8_t  _missedBeforeOffline  = 3;   // Missed heartbeats before marking offline
 
     bool _checksumEnabled = true;  // CRC32 on/off — must match ?ETM,CHKSM on WCBs
+
+    // ── WDP device-identity advert ───────────────────────────────────────────
+    // Set via setIdentity(); broadcast on the mesh as WCB_PACKET_WDP so WCBs
+    // discover this device. An empty _wdpType means advertising is off.
+    char          _wdpType[25]     = "";  // canonical device type (also the display name)
+    char          _wdpFw[28]       = "";  // firmware version string
+    char          _wdpHwRev[16]    = "";  // hardware revision ("" = omit)
+    char          _wdpCaps[49]     = "";  // space-separated capability tags ("" = omit)
+    uint8_t       _wdpBootLeft     = 0;   // remaining boot-burst adverts
+    unsigned long _wdpNextBootMs   = 0;   // next boot-burst advert due
+    unsigned long _wdpNextAdvertMs = 0;   // next periodic backstop advert due
 
     // ── Callbacks ────────────────────────────────────────────────────────────
     WCBCommandCallback   _commandCallback   = nullptr;
@@ -584,6 +621,17 @@ private:
 
     // Build and broadcast a HEARTBEAT packet so all WCBs know this device is alive.
     void _sendHeartbeat();
+
+    // ── WDP device-identity advert helpers ───────────────────────────────────
+    // Build the WDP TLV payload (magic + proto + DEVTYPE/FWVER/HWREV/CAPTAGS +
+    // END) into buf; returns the byte length. Mirrors the WCB firmware's
+    // wdpBuildPayload so a WCB decodes it into its neighbor table.
+    int  _buildWdpPayload(uint8_t* buf, int max);
+    // Broadcast one WDP advert (WCB_PACKET_WDP; raw TLV payload, no CRC — WDP
+    // carries TLV bytes, not a text command).
+    void _sendWdpAdvert();
+    // Drive the advert cadence (boot burst + ~60 s periodic). Called from update().
+    void _wdpTick();
 
     // Send an ACK packet back to the device that sent us a COMMAND.
     // targetID : sender's WCB ID to reply to

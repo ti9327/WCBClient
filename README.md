@@ -263,6 +263,35 @@ MiniMaestro maestro(stream, Maestro::noResetPin, deviceNumber);
 | `WCB_TARGET_KYBER` | 98 | Target ID for Kyber broadcast raw forwarding |
 | `WCB_SPECIAL_ID` | 20 | Out-of-band device slot (no WCB slot consumed) |
 
+### Device Identity (WDP)
+
+```cpp
+void setIdentity(const char* type, const char* fw,
+                 const char* hwRev = nullptr, const char* caps = nullptr);
+```
+
+Advertises this device on the WCB mesh so every board discovers it automatically
+— it shows up in `?WDP,LIST` and the config tool by name and firmware version,
+with no manual port labeling. This is the mesh counterpart of the serial
+**WDP-DA** device-announce protocol: a device describes itself the same way
+whether it's wired to a WCB serial port or joined over ESP-NOW.
+
+- `type` — canonical device name (e.g. `"NaviCore"`, `"Flthy HP Controller"`);
+  use a name from the shared WCB device vocabulary. Required — a null/empty
+  `type` leaves advertising off.
+- `fw` — this device's firmware version string.
+- `hwRev` — optional hardware revision (`"revB"`); omit with `nullptr`.
+- `caps` — optional space-separated capability tags (`"hp.servo hp.led"`);
+  omit with `nullptr`.
+
+Call it from `setup()` (before or after `begin()`); the advert goes out as a
+short boot burst and then periodically (~60 s, staggered) from `update()`.
+Requires ETM active on the WCBs (the factory default).
+
+```cpp
+wcb.setIdentity("NaviCore", "v0.2.0");
+```
+
 ---
 
 ## Callbacks
@@ -447,6 +476,17 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 ---
 
 ## Changelog
+
+### 1.7.0
+
+- **Device identity over WDP** — `setIdentity(type, fw, hwRev, caps)` broadcasts
+  this device's identity on the mesh via the Wireless Discovery Protocol, so
+  every WCB discovers it by name and firmware version automatically (it appears
+  in `?WDP,LIST` and the config tool as a named device, not a bare ID). This is
+  the mesh twin of the serial `WDP-DA` device-announce model. Advertising is a
+  short boot burst plus a staggered ~60 s backstop driven from `update()`, and
+  stays off until you call `setIdentity()`. Requires ETM active on the WCBs
+  (the factory default).
 
 ### 1.3.1
 
