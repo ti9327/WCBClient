@@ -150,6 +150,7 @@ void WCB_Client::update() {
     _processMonitors();
     _processFragJob();   // drain a pending fragmented send, one chunk per tick
     _wdpTick();          // WDP device-identity advert cadence (boot burst + periodic)
+    _ageNeighbors(now);  // expire WDP neighbors we haven't heard from recently
 
     // Service the pending table.
     for (int i = 0; i < WCB_PENDING_MAX; i++) {
@@ -679,6 +680,43 @@ void WCB_Client::onRawPacket(WCBRawPacketCallback callback) {
     _rawPacketCallback = callback;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// onNeighbor / getNeighbor / neighborCount — WDP consumer API
+//
+// A neighbor is any board on the mesh whose WDP advert we've decoded: another
+// WCB, or a WCB_Client device (isClient). Adverts arrive roughly every 30s and
+// age out after WCB_WDP_NEIGHBOR_TTL_MS of silence.
+// ─────────────────────────────────────────────────────────────────────────────
+void WCB_Client::onNeighbor(WCBNeighborCallback callback) {
+    _neighborCallback = callback;
+}
+
+const WCBNeighbor* WCB_Client::getNeighbor(uint8_t wcbNumber) {
+    if (wcbNumber < 1 || wcbNumber > WCB_MAX_BOARDS) return nullptr;
+    const WCBNeighbor& nb = _neighbors[wcbNumber - 1];
+    return nb.valid ? &nb : nullptr;
+}
+
+uint8_t WCB_Client::neighborCount() {
+    uint8_t n = 0;
+    for (int i = 0; i < WCB_MAX_BOARDS; i++)
+        if (_neighbors[i].valid) n++;
+    return n;
+}
+
+// Expire neighbors we haven't heard an advert from within the TTL. Fires
+// onNeighbor once more with valid=false so the app can drop it from any UI.
+void WCB_Client::_ageNeighbors(unsigned long now) {
+    for (int i = 0; i < WCB_MAX_BOARDS; i++) {
+        WCBNeighbor& nb = _neighbors[i];
+        if (!nb.valid) continue;
+        if ((long)(now - nb.lastSeenMs) >= (long)WCB_WDP_NEIGHBOR_TTL_MS) {
+            nb.valid = false;
+            if (_neighborCallback) _neighborCallback(nb);
+        }
+    }
+}
+
 // Unicast a raw buffer to a WCB's MAC (computed scheme). Registers the peer on
 // demand so a custom protocol (e.g. OTA) can reach any WCB without relying on
 // _registerPeers() having already added it. Returns true if ESP-NOW accepted it.
@@ -833,6 +871,13 @@ void WCB_Client::_sendHeartbeat() {
 #define WCB_WDP_TLV_DEVTYPE  0x0B   // string — canonical device type name
 #define WCB_WDP_TLV_HWREV    0x0C   // string — hardware revision
 #define WCB_WDP_TLV_CAPTAGS  0x0D   // string — space-separated capability tags
+// Decode-only TLVs (WCBs advertise these; the consumer below reads them).
+#define WCB_WDP_TLV_ALIAS     0x01  // string — WCB alias
+#define WCB_WDP_TLV_HWVER     0x04  // uint8  — WCB numeric hardware version
+#define WCB_WDP_TLV_CAPFLAGS  0x05  // uint16 LE — WCB capability bitmap
+#define WCB_WDP_TLV_MAESTRO   0x06  // bytes  — local Maestro IDs
+#define WCB_WDP_TLV_PORTLABEL 0x09  // [port][label] — one per labeled serial port
+#define WCB_WDP_TLV_CTRLID    0x0A  // uint8  — controller (special-peer) ID
 
 // Append one TLV; returns the new offset (unchanged if it wouldn't fit).
 static int wcbPutTLV(uint8_t* buf, int o, int max, uint8_t type,
@@ -903,6 +948,75 @@ void WCB_Client::_wdpTick() {
         _sendWdpAdvert();
         _wdpNextAdvertMs = now + 60000UL;
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// _handleWdpAdvert — WDP consumer
+//
+// Decode a neighbor's advert payload (magic 'W' + proto + [type][len][value]
+// TLVs, riding structCommand) into _neighbors[senderWCB-1] and fire onNeighbor.
+// Mirrors the WCB firmware's decoder; a client's DEVTYPE doubles as the name and
+// flags isClient. In-RAM parse only — safe to run inline in the receive callback.
+// ─────────────────────────────────────────────────────────────────────────────
+void WCB_Client::_handleWdpAdvert(uint8_t senderWCB, const uint8_t* cmd) {
+    if (senderWCB < 1 || senderWCB > WCB_MAX_BOARDS) return;
+    if (cmd[0] != (uint8_t)WCB_WDP_MAGIC || cmd[1] != WCB_WDP_PROTO) return;
+
+    WCBNeighbor& nb = _neighbors[senderWCB - 1];
+    memset(&nb, 0, sizeof(nb));            // a board is the sole authority for its facts — replace wholesale
+    nb.valid      = true;
+    nb.wcbNumber  = senderWCB;
+    nb.lastSeenMs = millis();
+
+    int o = 2;                             // skip magic + version
+    while (o + 2 <= 200) {
+        uint8_t type = cmd[o];
+        if (type == WCB_WDP_TLV_END) break;
+        int len = cmd[o + 1];
+        const uint8_t* val = &cmd[o + 2];
+        if (o + 2 + len > 200) break;      // truncated / malformed
+        switch (type) {
+            case WCB_WDP_TLV_ALIAS: {
+                int L = len > 24 ? 24 : len; memcpy(nb.name, val, L); nb.name[L] = '\0'; break;
+            }
+            case WCB_WDP_TLV_DEVTYPE: {    // client device type doubles as the name
+                int L = len > 24 ? 24 : len; memcpy(nb.name, val, L); nb.name[L] = '\0';
+                nb.isClient = true; break;
+            }
+            case WCB_WDP_TLV_FWVER: {
+                int L = len > 27 ? 27 : len; memcpy(nb.fw, val, L); nb.fw[L] = '\0'; break;
+            }
+            case WCB_WDP_TLV_HWVER:  if (len >= 1) nb.hwVer = val[0]; break;
+            case WCB_WDP_TLV_HWREV: {
+                int L = len > 15 ? 15 : len; memcpy(nb.hwRev, val, L); nb.hwRev[L] = '\0'; break;
+            }
+            case WCB_WDP_TLV_CAPFLAGS:
+                if (len >= 2) nb.capFlags = (uint16_t)val[0] | ((uint16_t)val[1] << 8);
+                break;
+            case WCB_WDP_TLV_CAPTAGS: {
+                int L = len > 48 ? 48 : len; memcpy(nb.capTags, val, L); nb.capTags[L] = '\0'; break;
+            }
+            case WCB_WDP_TLV_CTRLID:  if (len >= 1) nb.ctrlId = val[0]; break;
+            case WCB_WDP_TLV_MAESTRO: {
+                int L = len > 9 ? 9 : len; memcpy(nb.maestroIds, val, L); nb.maestroCount = (uint8_t)L; break;
+            }
+            case WCB_WDP_TLV_PORTLABEL: {
+                if (len >= 1) {
+                    int port = val[0];
+                    if (port >= 1 && port <= 5) {
+                        int L = len - 1; if (L > 24) L = 24;
+                        memcpy(nb.portLabels[port - 1], val + 1, L);
+                        nb.portLabels[port - 1][L] = '\0';
+                    }
+                }
+                break;
+            }
+            default: break;                // unknown TLV — skipped by length (forward-compatible)
+        }
+        o += 2 + len;
+    }
+
+    if (_neighborCallback) _neighborCallback(nb);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1231,6 +1345,14 @@ void WCB_Client::_handleReceive(const uint8_t* mac, const uint8_t* data, int len
                 _commandCallback((uint8_t)senderID, cmd);
             }
 
+            break;
+
+        // ── WDP advert ─────────────────────────────────────────────────────────
+        // A neighbor announcing itself. Decode its TLVs into the neighbor table
+        // and fire onNeighbor. No ACK — adverts are fire-and-forget.
+        case WCB_PACKET_WDP:
+            if (senderID >= 1 && senderID <= WCB_MAX_BOARDS && pkt->structCommandIncluded)
+                _handleWdpAdvert((uint8_t)senderID, (const uint8_t*)pkt->structCommand);
             break;
     }
 }

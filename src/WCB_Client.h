@@ -84,6 +84,8 @@ constexpr uint8_t broadcast = 0;
 #define WCB_SPECIAL_ID   20   // Device ID 20 is an out-of-band slot for third-party
                               // devices that don't consume a WCB slot in the system.
                               // Requires specialPeerEnabled = true on the WCBs.
+#define WCB_WDP_NEIGHBOR_TTL_MS 180000UL  // Drop a learned WDP neighbor after this
+                              // long without an advert (~6 missed 30s cycles).
 
 // ── Ensured-delivery (ETM) retransmit tuning ─────────────────────────────────
 // Applies ONLY to send()/broadcast() calls made with ensured=true. These values
@@ -206,6 +208,42 @@ struct WCBPending {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// WDP discovery — a neighbor learned from a WDP advert
+//
+// Populated by the WDP consumer when another WCB (or a WCB_Client device that
+// called setIdentity()) advertises itself. Read via getNeighbor()/onNeighbor().
+// RAM-only, TTL-aged. `name` holds a WCB's alias OR a client's device type.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Capability bitmap bits (mirror of the firmware WDP_CAP_*). Test capFlags with
+// e.g. (nb.capFlags & WCB_CAP_MAESTRO_HOST).
+#define WCB_CAP_HCR            0x0001
+#define WCB_CAP_MP3            0x0002
+#define WCB_CAP_WLED           0x0004
+#define WCB_CAP_KYBER_LOCAL    0x0008
+#define WCB_CAP_MAESTRO_REMOTE 0x0010
+#define WCB_CAP_PWM            0x0020
+#define WCB_CAP_CONTROLLER     0x0040
+#define WCB_CAP_MAESTRO_HOST   0x0080
+
+struct WCBNeighbor {
+    bool          valid;             // slot holds a learned neighbor
+    bool          isClient;          // a WCB_Client device (advertised a device type) vs a WCB
+    uint8_t       wcbNumber;         // 1..WCB_MAX_BOARDS
+    char          name[25];          // WCB alias, or the client's device type
+    char          fw[28];            // firmware version string
+    uint8_t       hwVer;             // WCB numeric hardware version (0 for clients)
+    char          hwRev[16];         // client hardware revision ("" for WCBs)
+    uint16_t      capFlags;          // WCB capability bitmap (WCB_CAP_* above)
+    char          capTags[49];       // client capability tags, space-separated
+    uint8_t       ctrlId;            // controller (special-peer) id this board links to; 0 = none
+    uint8_t       maestroIds[9];     // this board's local Maestro IDs
+    uint8_t       maestroCount;
+    char          portLabels[5][25]; // advertised serial-port labels ("" = unlabeled)
+    unsigned long lastSeenMs;        // millis() of the last advert heard
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Callback signatures
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -231,6 +269,12 @@ typedef void (*WCBStatusCallback)(uint8_t wcbID, bool online);
 //   data : raw packet bytes
 //   len  : packet length in bytes
 typedef void (*WCBRawPacketCallback)(const uint8_t* mac, const uint8_t* data, int len);
+
+// Called when a WDP advert is decoded from a neighbor (another WCB, or a
+// WCB_Client device that called setIdentity()). Runs in the ESP-NOW receive
+// (WiFi) task — keep it minimal; poll getNeighbor() from loop() for heavier
+// work. `nb` is valid only for the duration of the call.
+typedef void (*WCBNeighborCallback)(const WCBNeighbor& nb);
 
 
 // =============================================================================
@@ -429,6 +473,22 @@ public:
     // defer blocking work (see the NaviCore OTA enqueue/drain pattern).
     void onRawPacket(WCBRawPacketCallback callback);
 
+    // ── WDP discovery (consume neighbor adverts) ───────────────────────────
+
+    // Register a callback fired whenever a WDP advert is decoded from a neighbor
+    // (another WCB, or a WCB_Client device that called setIdentity()). Lets this
+    // device learn the mesh — who's out there and what they can do. Optional:
+    // the neighbor table is maintained regardless; poll it with getNeighbor().
+    void onNeighbor(WCBNeighborCallback callback);
+
+    // Return the learned neighbor with this WCB number (1..WCB_MAX_BOARDS), or
+    // nullptr if none has been heard (or it aged out). Do not retain the pointer
+    // across update() calls.
+    const WCBNeighbor* getNeighbor(uint8_t wcbNumber);
+
+    // Number of neighbors currently in the table.
+    uint8_t neighborCount();
+
     // Unicast a raw byte buffer to a WCB's MAC (computed from the shared scheme).
     // For custom protocols (e.g. OTA ACKs / relay forwards) that must send a
     // struct other than wcb_packet_etm_t. Registers the peer on demand if needed.
@@ -573,6 +633,10 @@ private:
     WCBStatusCallback    _statusCallback    = nullptr;
     WCBRawPacketCallback _rawPacketCallback = nullptr;
 
+    // ── WDP consumer ──────────────────────────────────────────────────────────
+    WCBNeighborCallback  _neighborCallback = nullptr;
+    WCBNeighbor          _neighbors[WCB_MAX_BOARDS] = {};   // learned mesh neighbors, indexed by (wcbNumber-1)
+
     // ── WCBStream registry ───────────────────────────────────────────────────
     // WCBStream instances self-register here during construction so update()
     // can call tick() on all of them automatically. Supports up to
@@ -704,6 +768,15 @@ private:
     // Process an incoming ESP-NOW packet. Routes to heartbeat, ACK, or command
     // handling based on structPacketType.
     void _handleReceive(const uint8_t* mac, const uint8_t* data, int len);
+
+    // Decode a WDP advert payload (magic 'W' + TLVs) into _neighbors[senderWCB-1]
+    // and fire the neighbor callback. Called from _handleReceive for packet type
+    // WCB_PACKET_WDP. In-RAM TLV parse only (no NVS/flash).
+    void _handleWdpAdvert(uint8_t senderWCB, const uint8_t* payload);
+
+    // Expire neighbors whose last advert is older than WCB_WDP_NEIGHBOR_TTL_MS.
+    // Called each update(); fires onNeighbor(valid=false) on expiry.
+    void _ageNeighbors(unsigned long now);
 
     // Find an empty slot in _pending[]. Returns index, or -1 if all slots are
     // occupied. Packets are still sent even when -1 is returned — they just

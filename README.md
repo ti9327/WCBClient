@@ -292,6 +292,52 @@ Requires ETM active on the WCBs (the factory default).
 wcb.setIdentity("NaviCore", "v0.2.0");
 ```
 
+### Discovering neighbors (WDP consumer)
+
+The same WDP adverts that `setIdentity()` broadcasts are also *decoded* by this
+library, so your device can learn every other board on the mesh — each WCB and
+each `setIdentity()`-enabled client — without any manual configuration.
+
+```cpp
+void onNeighbor(WCBNeighborCallback callback);   // fires when an advert is learned or expires
+const WCBNeighbor* getNeighbor(uint8_t wcbNumber);// latest record for a board, or nullptr
+uint8_t neighborCount();                          // how many neighbors are currently known
+```
+
+A neighbor is described by a `WCBNeighbor`:
+
+```cpp
+struct WCBNeighbor {
+    bool          valid;          // false when the slot has aged out
+    bool          isClient;       // true = a WCB_Client device, false = a WCB
+    uint8_t       wcbNumber;      // 1..20
+    char          name[25];       // WCB alias, or the client's device type
+    char          fw[28];         // firmware version string
+    uint8_t       hwVer;          // WCB numeric hardware version (0 for clients)
+    char          hwRev[16];      // client hardware revision ("" for WCBs)
+    uint16_t      capFlags;       // WCB capability bitmap — test with WCB_CAP_*
+    char          capTags[49];    // client capability tags, space-separated
+    uint8_t       ctrlId;         // controller (special-peer) id this board links to; 0 = none
+    uint8_t       maestroIds[9];  // this board's local Maestro IDs
+    uint8_t       maestroCount;
+    char          portLabels[5][25]; // advertised serial-port labels ("" = unlabeled)
+    unsigned long lastSeenMs;     // millis() of the last advert heard
+};
+```
+
+`onNeighbor` fires on the ESP-NOW (WiFi) task — keep it minimal and poll
+`getNeighbor()` from `loop()` for heavier work. Neighbors age out after
+`WCB_WDP_NEIGHBOR_TTL_MS` (180 s, ~6 missed cycles) of silence; the callback
+fires once more with `valid == false` on expiry so you can drop stale entries.
+
+```cpp
+wcb.onNeighbor([](const WCBNeighbor& nb) {
+    if (!nb.valid) { Serial.printf("WCB%u went quiet\n", nb.wcbNumber); return; }
+    Serial.printf("WCB%u = %s (%s)%s\n", nb.wcbNumber, nb.name, nb.fw,
+                  nb.capFlags & WCB_CAP_MAESTRO_HOST ? "  [has Maestro]" : "");
+});
+```
+
 ---
 
 ## Callbacks
@@ -476,6 +522,18 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 ---
 
 ## Changelog
+
+### 1.8.0
+
+- **WDP consumer** — the library now decodes the WDP adverts it already
+  broadcasts, so a client can discover the whole mesh. `onNeighbor()` fires as
+  boards are learned or age out, `getNeighbor(n)` returns the latest record for a
+  board, and `neighborCount()` reports how many are currently known. Each
+  `WCBNeighbor` carries alias/device-type, firmware, hardware version/revision,
+  capability flags (`WCB_CAP_*`) and tags, the controller link id, local Maestro
+  IDs and serial-port labels. Neighbors expire after 180 s of silence. Consuming
+  is passive — no extra traffic, and it works whether or not you called
+  `setIdentity()`.
 
 ### 1.7.0
 
