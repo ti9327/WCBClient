@@ -489,6 +489,28 @@ public:
     // Number of neighbors currently in the table.
     uint8_t neighborCount();
 
+    // Auto-join (default ON): when this device decodes a WDP advert from a
+    // regular WCB it isn't already peered with, it registers that board as an
+    // ESP-NOW peer LIVE — so the fleet is discovered without setting wcb_quantity
+    // to cover it, and without pre-registering slots for boards that may not
+    // exist (the ESP-NOW peer table caps at ~20). A board is joined only after
+    // it has been heard advertise at least twice. Client devices (other
+    // setIdentity() peers) and the special peer are never auto-joined.
+    //
+    // A learned peer is PERMANENT: it is saved to NVS, restored on every
+    // begin(), and from then on always expected to be on and ready (heartbeats
+    // drive its online/offline state, but membership never self-evicts). If the
+    // peer table gets crowded, cleanup is the user's call — forgetPeer() /
+    // clearLearnedPeers(). Turn auto-join OFF to pin the peer set to exactly
+    // 1..wcb_quantity (+ special).
+    void setAutoJoin(bool enabled);
+    bool autoJoinEnabled() const { return _autoJoin; }
+
+    // Drop one auto-joined peer (deregisters it and removes it from NVS), or all
+    // of them. Floor peers (1..wcb_quantity) and the special peer are unaffected.
+    void forgetPeer(uint8_t id);
+    void clearLearnedPeers();
+
     // Unicast a raw byte buffer to a WCB's MAC (computed from the shared scheme).
     // For custom protocols (e.g. OTA ACKs / relay forwards) that must send a
     // struct other than wcb_packet_etm_t. Registers the peer on demand if needed.
@@ -636,6 +658,9 @@ private:
     // ── WDP consumer ──────────────────────────────────────────────────────────
     WCBNeighborCallback  _neighborCallback = nullptr;
     WCBNeighbor          _neighbors[WCB_MAX_BOARDS] = {};   // learned mesh neighbors, indexed by (wcbNumber-1)
+    bool                 _autoJoin = true;                  // register regular WCBs heard via WDP as peers, live
+    bool                 _learnedPeer[WCB_MAX_BOARDS] = {}; // auto-joined ids (beyond 1..quantity)
+    uint8_t              _advertCount[WCB_MAX_BOARDS] = {}; // WDP adverts heard per board (join needs >=2)
 
     // ── WCBStream registry ───────────────────────────────────────────────────
     // WCBStream instances self-register here during construction so update()
@@ -775,8 +800,20 @@ private:
     void _handleWdpAdvert(uint8_t senderWCB, const uint8_t* payload);
 
     // Expire neighbors whose last advert is older than WCB_WDP_NEIGHBOR_TTL_MS.
-    // Called each update(); fires onNeighbor(valid=false) on expiry.
+    // Called each update(); fires onNeighbor(valid=false) on expiry. Also drops
+    // (deregisters) an auto-joined peer that has aged out.
     void _ageNeighbors(unsigned long now);
+
+    // Register a regular WCB learned via WDP as an ESP-NOW peer, live, and
+    // persist it. Derived MAC, idempotent, guarded against self / the special
+    // peer / the 1..quantity floor / the ~20-peer cap. Returns true if it's a
+    // registered learned peer.
+    bool _addLearnedPeer(uint8_t id);
+
+    // Learned-peer NVS persistence ("wcb_peers": ver + octet fingerprint +
+    // 20-bit membership mask). Saved on join/forget; loaded during begin().
+    void _saveLearnedPeers();
+    void _loadLearnedPeers();
 
     // Find an empty slot in _pending[]. Returns index, or -1 if all slots are
     // occupied. Packets are still sent even when -1 is returned — they just

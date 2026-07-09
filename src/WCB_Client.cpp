@@ -1,6 +1,7 @@
 #include "WCB_Client.h"
 #include "WCBStream.h"
 #include <esp_wifi.h>
+#include <Preferences.h>   // learned-peer persistence (NVS)
 
 // Singleton instance pointer — allows the static ESP-NOW callback to route
 // received packets back to the active WCB_Client object. Only one WCB_Client
@@ -114,6 +115,10 @@ bool WCB_Client::begin() {
     // Pre-register every WCB MAC and the broadcast MAC as ESP-NOW peers.
     // ESP-NOW requires a peer to be registered before you can send to it.
     _registerPeers();
+
+    // Restore auto-joined peers persisted by a previous session — they are
+    // permanent members until the app forgets them (forgetPeer/clearLearnedPeers).
+    _loadLearnedPeers();
     _started = true;             // enableSpecialPeer() after begin() registers immediately
 
     Serial.printf("[WCB_Client] Joined WCB network as device ID %d "
@@ -704,6 +709,13 @@ uint8_t WCB_Client::neighborCount() {
     return n;
 }
 
+// Enable/disable auto-join. Turning it OFF stops NEW boards from being learned;
+// already-registered learned peers stay until they age out or the device
+// restarts. Turning it ON lets subsequently-heard boards join.
+void WCB_Client::setAutoJoin(bool enabled) {
+    _autoJoin = enabled;
+}
+
 // Expire neighbors we haven't heard an advert from within the TTL. Fires
 // onNeighbor once more with valid=false so the app can drop it from any UI.
 void WCB_Client::_ageNeighbors(unsigned long now) {
@@ -830,6 +842,115 @@ void WCB_Client::_registerSpecialPeer() {
     peer.channel = 0;
     peer.encrypt = false;
     esp_now_add_peer(&peer);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// _addLearnedPeer
+//
+// Register a regular WCB (learned via a WDP advert) as an ESP-NOW peer, live,
+// and remember it in NVS. Uses the same derived MAC scheme as _buildMACs(), so
+// no address is learned — only the FACT that the board exists. Idempotent, and
+// guarded against self, the special peer, ids already covered by the
+// 1..quantity floor, and the ~20-peer ESP-NOW cap. A learned peer is PERMANENT:
+// it is restored on every begin() and is always expected to be on and ready.
+// Offline-detection tracks its heartbeat liveness, but membership never
+// self-evicts — only forgetPeer()/clearLearnedPeers() remove it. If the peer
+// table gets crowded, clearing it up is deliberately the user's call.
+// ─────────────────────────────────────────────────────────────────────────────
+bool WCB_Client::_addLearnedPeer(uint8_t id) {
+    if (id < 1 || id > WCB_MAX_BOARDS)  return false;
+    if (id == _deviceID)                return false;   // that's us
+    if (id == _specialPeerID)           return false;   // controller, registered separately
+    if (id <= _quantity)                return false;   // already a floor peer
+    int idx = id - 1;
+    if (_learnedPeer[idx])              return true;    // already joined
+
+    if (!esp_now_is_peer_exist(_wcbMACs[idx])) {
+        esp_now_peer_info_t peer = {};
+        memcpy(peer.peer_addr, _wcbMACs[idx], 6);
+        peer.channel = 0;
+        peer.encrypt = false;
+        if (esp_now_add_peer(&peer) != ESP_OK) {
+            Serial.printf("[WCB_Client] auto-join: could not add WCB%d (peer table full?)\n", id);
+            return false;
+        }
+    }
+    _learnedPeer[idx] = true;
+    _saveLearnedPeers();     // joining is a rare, one-time event — persist immediately
+    Serial.printf("[WCB_Client] auto-joined WCB%d\n", id);
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Learned-peer persistence (NVS namespace "wcb_peers")
+//
+// Only MEMBERSHIP is stored, as a 20-bit mask — identity re-learns from adverts
+// and MACs are always derived, so there is nothing else to keep. The blob is
+// fingerprinted with the network octets: change oct2/oct3 (a different mesh)
+// and the old membership is discarded instead of deriving wrong-group MACs.
+// Mirrors the WCB firmware's "learned_peers" scheme.
+// ─────────────────────────────────────────────────────────────────────────────
+void WCB_Client::_saveLearnedPeers() {
+    uint32_t mask = 0;
+    for (int i = 0; i < WCB_MAX_BOARDS; i++)
+        if (_learnedPeer[i]) mask |= (1UL << i);
+    Preferences prefs;
+    prefs.begin("wcb_peers", false);
+    prefs.putUChar("ver", 1);
+    prefs.putUChar("o2", _oct2);
+    prefs.putUChar("o3", _oct3);
+    prefs.putUInt("mask", mask);
+    prefs.end();
+}
+
+void WCB_Client::_loadLearnedPeers() {
+    Preferences prefs;
+    prefs.begin("wcb_peers", true);
+    uint8_t  ver  = prefs.getUChar("ver", 0);
+    uint8_t  o2   = prefs.getUChar("o2", 0);
+    uint8_t  o3   = prefs.getUChar("o3", 0);
+    uint32_t mask = prefs.getUInt("mask", 0);
+    prefs.end();
+
+    if (ver != 1) return;                       // nothing saved (or unknown schema)
+    if (o2 != _oct2 || o3 != _oct3) {           // saved under a different network
+        Preferences wipe;
+        wipe.begin("wcb_peers", false);
+        wipe.clear();
+        wipe.end();
+        return;
+    }
+
+    int restored = 0;
+    for (int i = 0; i < WCB_MAX_BOARDS; i++) {
+        if (!(mask & (1UL << i))) continue;
+        uint8_t id = i + 1;
+        // Ids now covered by the floor/special/self are skipped (e.g. the app
+        // raised wcb_quantity since the save) — _addLearnedPeer re-derives the
+        // guards, so a stale bit simply doesn't re-join.
+        if (_addLearnedPeer(id)) restored++;
+    }
+    if (restored > 0)
+        Serial.printf("[WCB_Client] restored %d learned peer(s)\n", restored);
+}
+
+// Forget one auto-joined peer: deregister it, drop it from NVS, mark it offline.
+// Floor peers (1..wcb_quantity) and the special peer are unaffected.
+void WCB_Client::forgetPeer(uint8_t id) {
+    if (id < 1 || id > WCB_MAX_BOARDS) return;
+    int idx = id - 1;
+    if (!_learnedPeer[idx]) return;
+    _learnedPeer[idx] = false;
+    if (esp_now_is_peer_exist(_wcbMACs[idx])) esp_now_del_peer(_wcbMACs[idx]);
+    _boards[idx].online = false;
+    _saveLearnedPeers();
+    Serial.printf("[WCB_Client] forgot WCB%d\n", id);
+}
+
+// Forget ALL auto-joined peers (the user-cleanup handle for a crowded table).
+void WCB_Client::clearLearnedPeers() {
+    for (int i = 0; i < WCB_MAX_BOARDS; i++)
+        if (_learnedPeer[i]) forgetPeer(i + 1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1016,6 +1137,15 @@ void WCB_Client::_handleWdpAdvert(uint8_t senderWCB, const uint8_t* cmd) {
         o += 2 + len;
     }
 
+    // Auto-join: register a regular WCB (not a client device, not the special
+    // peer) as an ESP-NOW peer once we've heard it advertise at least twice, so
+    // a single stray/spoofed advert can't add a peer. The sender was bound to its
+    // source MAC in _handleReceive, so senderWCB is trustworthy here.
+    if (_autoJoin && !nb.isClient) {
+        if (_advertCount[senderWCB - 1] < 255) _advertCount[senderWCB - 1]++;
+        if (_advertCount[senderWCB - 1] >= 2) _addLearnedPeer(senderWCB);
+    }
+
     if (_neighborCallback) _neighborCallback(nb);
 }
 
@@ -1163,7 +1293,11 @@ void WCB_Client::_checkOfflineBoards() {
     unsigned long threshold = (unsigned long)_heartbeatIntervalSec
                               * _missedBeforeOffline * 1000UL;
 
-    for (int i = 0; i < _quantity; i++) {
+    for (int i = 0; i < WCB_MAX_BOARDS; i++) {
+        // Sweep floor peers (1..quantity) AND auto-joined learned peers; a learned
+        // board above the floor must still transition offline when its heartbeats
+        // stop, so ensured retries to it stop and the status callback fires.
+        if (i >= _quantity && !_learnedPeer[i]) continue;
         if (!_boards[i].online) continue;
         if (now - _boards[i].lastSeenMs > threshold) {
             _boards[i].online = false;
@@ -1266,6 +1400,13 @@ void WCB_Client::_handleReceive(const uint8_t* mac, const uint8_t* data, int len
 
     int senderID = atoi(pkt->structSenderID);
     int targetID = atoi(pkt->structTargetID);
+
+    // Bind the claimed sender id to its real MAC. The octet check above already
+    // proved octets 0-4; every WCB and WCB_Client forces its STA MAC's LAST octet
+    // to its board number (02:oct2:oct3:00:00:<id>, see _buildMACs), so a packet
+    // whose structSenderID disagrees with mac[5] is spoofed or misconfigured.
+    // Drop it before it can mark a board online, satisfy an ACK, or auto-join.
+    if (senderID >= 1 && senderID <= WCB_MAX_BOARDS && (uint8_t)senderID != mac[5]) return;
 
     // Only process packets addressed to us or to everyone
     if (targetID != WCB_TARGET_BROADCAST && targetID != _deviceID) return;

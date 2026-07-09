@@ -338,6 +338,34 @@ wcb.onNeighbor([](const WCBNeighbor& nb) {
 });
 ```
 
+#### Auto-join
+
+By default the same adverts also drive **auto-join**: when this device hears a
+regular WCB it isn't already peered with (after two adverts), it registers that
+board as an ESP-NOW peer live. So you can leave `wcb_quantity` at whatever covers
+the boards you address directly and still reach boards discovered later — without
+pre-registering all 20 slots (the ESP-NOW peer table is small). Client devices
+and the special peer are never auto-joined.
+
+A learned peer is **permanent**: it is saved to NVS, restored on every `begin()`,
+and from then on always expected to be on and ready. Heartbeats drive its
+online/offline state, but membership never expires on its own — a board that's
+powered down stays a member and is simply reported offline until it returns.
+Removing one is deliberately a user action:
+
+```cpp
+void setAutoJoin(bool enabled);   // default true
+bool autoJoinEnabled() const;
+void forgetPeer(uint8_t id);      // drop one learned peer (deregisters + clears NVS)
+void clearLearnedPeers();         // drop all learned peers
+```
+
+Turn auto-join off to pin the peer set to exactly `1..wcb_quantity` (+ special peer):
+
+```cpp
+wcb.setAutoJoin(false);
+```
+
 ---
 
 ## Callbacks
@@ -522,6 +550,24 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 ---
 
 ## Changelog
+
+### 1.9.0
+
+- **Auto-join (on by default)** — the device now registers a regular WCB it hears
+  over WDP as an ESP-NOW peer *live*, once it has seen the board advertise at
+  least twice. This means it discovers the fleet on its own: you no longer have
+  to set `wcb_quantity` high enough to cover every board, and it doesn't burn
+  peer-table slots (the ESP-NOW cap is ~20) on boards that may not exist. Client
+  devices (other `setIdentity()` peers) and the special peer are never
+  auto-joined. Learned peers are **permanent**: persisted to NVS, restored on
+  every `begin()`, always expected on the mesh (offline detection covers them
+  too) — membership never expires on its own. Manage it with `setAutoJoin(bool)`
+  / `autoJoinEnabled()` / `forgetPeer(id)` / `clearLearnedPeers()`.
+- **Sender-MAC binding** — inbound packets are now dropped when the claimed
+  `structSenderID` disagrees with the source MAC's last octet (every board forces
+  its derived MAC `02:oct2:oct3:00:00:id`). Closes id-spoofing — a rogue in-group
+  node can no longer claim another board's id to satisfy an ACK or trigger
+  auto-join. Mirrors the same hardening added to the WCB firmware.
 
 ### 1.8.0
 
