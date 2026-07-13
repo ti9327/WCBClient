@@ -621,6 +621,15 @@ private:
     // ── Board tracking ───────────────────────────────────────────────────────
     WCBBoardStatus _boards[WCB_MAX_BOARDS];   // Online/offline state per WCB slot
     WCBPending     _pending[WCB_PENDING_MAX]; // In-flight commands awaiting ACK
+    // The pending table is mutated from BOTH cores: the loop task (send()/
+    // broadcast() → _sendPacket claim+fill, and update()'s retry service) AND
+    // the ESP-NOW receive callback / WiFi task (the ACK handler marking a slot
+    // acked/freed). A slot claim (write active+seqNum+expected) and the ACK scan
+    // (match seqNum, set acked/active) must not interleave across cores, or a
+    // half-filled slot can be matched to a stale ACK and torn. This spinlock
+    // serializes the two short critical regions (claim+fill in _sendPacket, ACK
+    // apply in _handleReceive). Only _seqCounter needs to stay separately atomic.
+    portMUX_TYPE   _pendingMux = portMUX_INITIALIZER_UNLOCKED;
 
     // ── ETM state ────────────────────────────────────────────────────────────
     // Atomic: the sequence number is incremented from BOTH cores — the main
