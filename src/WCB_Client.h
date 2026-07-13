@@ -512,6 +512,15 @@ public:
     void forgetPeer(uint8_t id);
     void clearLearnedPeers();
 
+    // True if `id` is currently an auto-joined (learned) peer — i.e. a node above
+    // the wcb_quantity floor that was heard over WDP and made a PERMANENT peer.
+    // Membership persists across reboots and is independent of online/offline
+    // state, so callers can show a learned peer even while it's powered off (its
+    // WDP advert ages out and, for a client, it never heartbeats).
+    bool isLearnedPeer(uint8_t id) const {
+        return id >= 1 && id <= WCB_MAX_BOARDS && _learnedPeer[id - 1];
+    }
+
     // Unicast a raw byte buffer to a WCB's MAC (computed from the shared scheme).
     // For custom protocols (e.g. OTA ACKs / relay forwards) that must send a
     // struct other than wcb_packet_etm_t. Registers the peer on demand if needed.

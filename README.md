@@ -551,6 +551,17 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 
 ## Changelog
 
+### 1.9.4
+
+- **`isLearnedPeer(uint8_t id)` accessor.** Query whether an id is currently an
+  auto-joined (learned) peer — a node above the `wcb_quantity` floor that was heard
+  over WDP and made a permanent peer. Membership persists across reboots and is
+  independent of online/offline state, so a consumer can keep a learned peer listed
+  (e.g. on a status panel) even while it's powered off — its WDP advert ages out and,
+  for a client device, it never heartbeats.
+- **New example: `AllFeatures`** — an interactive, serial-menu "kitchen sink" sketch
+  exercising every public method in one place.
+
 ### 1.9.3
 
 - **Auto-join now learns CLIENT devices too** (mesh monitors, other controllers,
