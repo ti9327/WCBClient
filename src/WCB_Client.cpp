@@ -993,6 +993,11 @@ void WCB_Client::forgetPeer(uint8_t id) {
     _advertCount[idx] = 0;   // reset so it must be heard >=2 times again before it can re-join
     if (esp_now_is_peer_exist(_wcbMACs[idx])) esp_now_del_peer(_wcbMACs[idx]);
     _boards[idx].online = false;
+    // Also drop the WDP discovery record so getNeighbor(id) goes null immediately —
+    // otherwise a just-forgotten peer keeps showing (via getNeighbor) for up to
+    // WCB_WDP_NEIGHBOR_TTL_MS until the advert ages out. It repopulates on its next
+    // advert (and re-joins via auto-join after >=2 adverts), which is intended.
+    _neighbors[idx] = WCBNeighbor{};
     _saveLearnedPeers();
     Serial.printf("[WCB_Client] forgot WCB%d\n", id);
 }
