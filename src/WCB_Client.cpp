@@ -51,19 +51,26 @@ WCB_Client::WCB_Client(uint8_t mac_oct2, uint8_t mac_oct3,
 bool WCB_Client::begin() {
 
     // ── Validate device_id ───────────────────────────────────────────────────
-    // device_id must be 1–WCB_MAX_BOARDS. If it's not the special slot (20)
-    // it must also be within the declared network size so the WCBs already have
-    // this MAC pre-registered in their peer tables.
+    // device_id must be 1–WCB_MAX_BOARDS (hard-fail otherwise). A value ABOVE
+    // wcb_quantity (and not the special slot 20) is ALLOWED but non-standard: the
+    // floor boards (1..quantity) haven't pre-registered this MAC, so the device is
+    // reachable INBOUND only once they auto-join it from its WDP advert — call
+    // setIdentity() and keep auto-join on. begin() only WARNS in that case.
     if (_deviceID == 0 || _deviceID > WCB_MAX_BOARDS) {
         Serial.printf("[WCB_Client] ERROR: device_id %d is out of range (1–%d)\n",
                       _deviceID, WCB_MAX_BOARDS);
         return false;
     }
+    // NON-FATAL: an id above wcb_quantity (and not the special slot 20) is allowed.
+    // Index safety is already guaranteed by the out-of-range hard-fail above, and
+    // every board array is sized WCB_MAX_BOARDS. The only consequence is inbound
+    // reachability, which auto-join resolves once the floor boards hear this
+    // device's WDP advert (setIdentity()).
     if (_deviceID != WCB_SPECIAL_ID && _deviceID > _quantity) {
-        Serial.printf("[WCB_Client] ERROR: device_id %d exceeds wcb_quantity %d. "
-                      "Use device_id <= quantity or device_id = %d for the special slot.\n",
-                      _deviceID, _quantity, WCB_SPECIAL_ID);
-        return false;
+        Serial.printf("[WCB_Client] WARNING: device_id %d is above wcb_quantity %d - "
+                      "allowed, but the floor boards can't reach it until they auto-join "
+                      "it from its WDP advert; call setIdentity() and keep auto-join on.\n",
+                      _deviceID, _quantity);
     }
 
     // ── Reset internal state ─────────────────────────────────────────────────
@@ -182,6 +189,24 @@ void WCB_Client::update() {
     // small callback stack and crash. Doing them here makes them safe.
     for (int i = 0; i < WCB_MAX_BOARDS; i++) {
         if (_pendingJoin[i]) { _pendingJoin[i] = false; _addLearnedPeer((uint8_t)(i + 1)); }
+    }
+
+    // Register transient reply-peers flagged on the RX callback (an authenticated
+    // above-floor sender we couldn't unicast an ACK/reply to yet). Same discipline
+    // as auto-join above — the bool is set on Core 0, the esp_now_add_peer runs
+    // HERE on the loop task — but with NO NVS write: this is not a learned member,
+    // just enough of a peer to answer whoever just talked to us. Auto-join still
+    // persists genuine members separately. Lands within ~1 loop, so the sender's
+    // next command (the config tool re-pings 6x/500ms on connect) gets its reply.
+    for (int i = 0; i < WCB_MAX_BOARDS; i++) {
+        if (!_pendingReplyPeer[i]) continue;
+        _pendingReplyPeer[i] = false;
+        if (esp_now_is_peer_exist(_wcbMACs[i])) continue;
+        esp_now_peer_info_t peer = {};
+        memcpy(peer.peer_addr, _wcbMACs[i], 6);
+        peer.channel = 0;
+        peer.encrypt = false;
+        esp_now_add_peer(&peer);
     }
 
     // Service the pending table. _pending[] is mutated cross-core (the ACK handler
@@ -1563,6 +1588,20 @@ void WCB_Client::_handleReceive(const uint8_t* mac, const uint8_t* data, int len
             // This prevents the sender from flooding retries at us.
             if (senderID >= 1 && senderID <= WCB_MAX_BOARDS)
                 _sendAck((uint8_t)senderID, pkt->structSequenceNumber);
+
+            // A command from an authenticated sender means we may need to unicast
+            // back to it — the ACK above, and any reply the callback sends. If it's
+            // an ABOVE-FLOOR sender that isn't a registered peer yet (e.g. a client
+            // / relay before auto-join's >=2-advert threshold), esp_now_send to it
+            // fails (NOT_FOUND) and the reply is silently lost. Flag it (cheap bool,
+            // same discipline as _pendingJoin) so update() registers it as a
+            // transient peer on the LOOP task — NEVER add_peer on this RX callback
+            // (the documented boot-loop hazard). Floor/special/self and already-
+            // learned ids are skipped: they're registered already.
+            if (senderID > _quantity && senderID <= WCB_MAX_BOARDS &&
+                senderID != _deviceID && senderID != _specialPeerID &&
+                senderID != WCB_SPECIAL_ID && !_learnedPeer[senderID - 1])
+                _pendingReplyPeer[senderID - 1] = true;
 
             if (pkt->structCommandIncluded && _commandCallback) {
                 char cmd[201];

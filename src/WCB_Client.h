@@ -298,7 +298,10 @@ public:
     // password    : network password — must match all WCBs  (max 39 chars)
     // wcb_quantity: total WCBs in the system (?WCBQ value)
     // device_id   : this device's unique ID on the network
-    //               1–19 : must be <= wcb_quantity; WCBs pre-register this MAC
+    //               1–19 : any id here is allowed. If <= wcb_quantity the WCBs
+    //                       pre-register this MAC. If > wcb_quantity it's reachable
+    //                       INBOUND only after the floor boards auto-join it from
+    //                       its WDP advert — call setIdentity() (begin() warns).
     //               20   : special out-of-band slot (requires specialPeerEnabled
     //                       on the WCBs, does not consume a WCB slot)
     // commandCb   : optional — called when a command is received from the network
@@ -681,6 +684,7 @@ private:
     bool                 _learnedPeer[WCB_MAX_BOARDS] = {}; // auto-joined ids (beyond 1..quantity)
     uint8_t              _advertCount[WCB_MAX_BOARDS] = {}; // WDP adverts heard per board (join needs >=2)
     volatile bool        _pendingJoin[WCB_MAX_BOARDS] = {}; // flagged in RX callback, drained in update() (loop task)
+    volatile bool        _pendingReplyPeer[WCB_MAX_BOARDS] = {}; // RX-callback flag: an authenticated above-floor sender we can't unicast to yet; update() adds it as a transient ESP-NOW peer (no NVS) so we can ACK/reply immediately
 
     // ── WCBStream registry ───────────────────────────────────────────────────
     // WCBStream instances self-register here during construction so update()

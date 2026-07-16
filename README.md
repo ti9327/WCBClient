@@ -546,10 +546,41 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 | `MaestroUnicast` | Forward Maestro commands to a specific WCB:port (unicast) |
 | `MaestroBroadcast` | Broadcast Maestro commands to all WCBs with Maestros configured |
 | `CombinedUsage` | Text commands and Maestro forwarding running simultaneously |
+| `SpecialPeer` | Talk to the out-of-band controller (e.g. NaviCore) at id 20 |
+| `NeighborDiscovery` | Learn the mesh over WDP — who's out there and what they can do |
+| `MgmtRelay` | Turn any ESP32 into a USB-serial ↔ ESP-NOW management relay — drive the Config Tool (Via WCB) and manage every WCB + the NaviCore over one USB port |
+| `AllFeatures` | Interactive "kitchen sink" — every public method in one sketch |
 
 ---
 
 ## Changelog
+
+### 1.9.6
+
+- **`device_id` may now sit above `wcb_quantity`.** `begin()` no longer hard-fails
+  when `device_id > wcb_quantity` (for ids 1–19) — it logs a non-fatal warning and
+  joins the mesh anyway. `wcb_quantity` means "how many WCBs I pre-register," not a
+  cap on this device's own id. A device above the floor is reachable **inbound**
+  once the other boards auto-join it from its WDP advert, so call `setIdentity()`
+  and keep auto-join on (the default). The normal case (`device_id <= wcb_quantity`)
+  is byte-for-byte unchanged. This also un-breaks the `AllFeatures` example, whose
+  `device_id 19 / quantity 4` combo previously failed `begin()`.
+- **Reply to any authenticated sender.** A board can now unicast an ACK/reply to
+  an above-floor client that commands it *before* auto-join has registered it: the
+  sender is flagged on the ESP-NOW receive callback and added as a **transient**
+  ESP-NOW peer on the loop task (no NVS write, no ≥2-advert wait), matching the
+  proven auto-join discipline. So e.g. the NaviCore answers a `MgmtRelay` at id 19
+  on the config tool's very next ping instead of never — which is what makes the
+  above-floor `device_id` genuinely usable for a bridge/relay/monitor.
+- **New example: `MgmtRelay`** — turn any ESP32 into a USB-serial ↔ ESP-NOW
+  management relay so a host tool (e.g. the NaviCore Config Tool in "Via WCB" mode)
+  can drive every WCB *and* the NaviCore over one USB port.
+
+### 1.9.5
+
+- **`forgetPeer()` now also clears the peer's WDP neighbor record**, so a forgotten
+  peer drops off `getNeighbor()` immediately instead of lingering until its advert
+  ages out (up to the neighbor TTL).
 
 ### 1.9.4
 
