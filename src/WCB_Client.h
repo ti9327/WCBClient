@@ -314,6 +314,13 @@ public:
     // register all WCB peers, and begin the heartbeat timer.
     // Call once from setup(). Returns true on success.
     // On failure the library prints a descriptive error to Serial.
+    //
+    // AP coexistence: if a SoftAP is already up (WiFi.softAP() called BEFORE
+    // begin()), it is preserved — WiFi is switched to WIFI_AP_STA instead of
+    // WIFI_STA, and ESP-NOW rides the AP's radio channel (AP and STA share one
+    // channel on the ESP32). Bring up the AP first with the channel you want
+    // the whole WCB mesh to use; calling softAP() AFTER begin() also works
+    // (Arduino's WiFi.mode() ORs in WIFI_AP without dropping STA).
     bool begin();
 
     // ── Main loop ────────────────────────────────────────────────────────────

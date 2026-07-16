@@ -74,16 +74,35 @@ bool WCB_Client::begin() {
     memset(_pending, 0, sizeof(_pending));
 
     // ── WiFi setup ───────────────────────────────────────────────────────────
-    // ESP-NOW requires WiFi to be in station mode. We disconnect from any AP
-    // so no association overhead interferes with ESP-NOW timing. esp_now_init()
-    // fails outright if the WiFi driver is not running, so verify STA mode took
-    // before we get there — that failure is the usual root cause of a crash on
-    // the first heartbeat.
-    if (!WiFi.mode(WIFI_STA)) {
-        Serial.println("[WCB_Client] WARNING: WiFi.mode(WIFI_STA) reported failure "
-                       "— ESP-NOW init will likely fail below");
+    // ESP-NOW requires WiFi to have station mode enabled. esp_now_init() fails
+    // outright if the WiFi driver is not running, so verify the mode change
+    // took before we get there — that failure is the usual root cause of a
+    // crash on the first heartbeat.
+    //
+    // If the sketch has already brought up a SoftAP (e.g. hosting a web UI),
+    // preserve it — AP and STA share a single radio channel on the ESP32, so
+    // ESP-NOW simply rides whatever channel the AP is already on instead of
+    // forcing STA-only and tearing the AP down. WiFi.disconnect() only drops
+    // a STA association (default wifioff=false), so it's already AP-safe on
+    // its own.
+    wifi_mode_t priorMode = WiFi.getMode();
+    bool apActive = (priorMode == WIFI_MODE_AP || priorMode == WIFI_MODE_APSTA);
+    wifi_mode_t targetMode = apActive ? WIFI_AP_STA : WIFI_STA;
+    if (!WiFi.mode(targetMode)) {
+        Serial.printf("[WCB_Client] WARNING: WiFi.mode(%s) reported failure "
+                      "— ESP-NOW init will likely fail below\n",
+                      apActive ? "WIFI_AP_STA" : "WIFI_STA");
     }
     WiFi.disconnect();
+
+    if (apActive) {
+        // Modem sleep is far more likely to bite once the AP is actively
+        // serving clients — a missed ESP-NOW heartbeat here reads as this
+        // device going offline to the rest of the mesh.
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        Serial.println("[WCB_Client] SoftAP detected — running WIFI_AP_STA, "
+                       "ESP-NOW sharing the AP's radio channel");
+    }
 
     // ── Build MAC table ──────────────────────────────────────────────────────
     // Must happen BEFORE esp_wifi_set_mac() so _wcbMACs[] is populated.
