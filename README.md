@@ -111,7 +111,7 @@ miss ESP-NOW packets. Disable it with `esp_wifi_set_ps(WIFI_PS_NONE)` (or
 | If you need… | Result with this library |
 |---|---|
 | WCB ESP-NOW only | ✅ Intended use — works out of the box |
-| SoftAP (hosted web UI) + WCB on the same board | ✅ Supported — `begin()` preserves an existing/later SoftAP as `WIFI_AP_STA`; pick the AP's channel deliberately |
+| SoftAP (hosted web UI) + WCB on the same board | ✅ Supported — `begin()` preserves an existing/later SoftAP as `WIFI_AP_STA`. The AP owns the single radio's channel, so bring it up on the mesh channel (`WiFi.softAP(ssid, pass, 1)`); the library **warns** (never force-moves it) if the radio ends up elsewhere. Match a non-default fleet channel with `setMeshChannel()`. |
 | WiFi STA (associating with an external router) + WCB on the same board | ⚠️ Only if all peers share the router's fixed channel; `begin()` still disconnects STA |
 | A second, separate ESP-NOW network | ❌ Not supported — single global receive callback |
 | Multiple `WCB_Client` objects | ❌ Not supported — singleton |
@@ -249,6 +249,7 @@ void loop() {
 | `onCommand(callback)` | Register or replace the received-command callback. |
 | `onStatusChange(callback)` | Register or replace the online/offline status callback. |
 | `setChecksum(bool)` | Enable/disable CRC32 checksums. Must match `?ETM,CHKSM` setting on WCBs (default: on). |
+| `setMeshChannel(uint8_t)` | Set the ESP-NOW mesh channel (1–11) this device expects. Best called before `begin()` if your fleet runs on a non-default channel (set on the WCBs via `?WCBCH` / the Wizard); calling it after `begin()` also re-pins the radio live when no SoftAP is active. One radio = one channel (default: 1). |
 
 ### WCBStream
 
@@ -569,6 +570,20 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 ---
 
 ## Changelog
+
+### 1.9.7
+
+- **Configurable ESP-NOW mesh channel.** The mesh channel (1–11) is now an explicit,
+  operator-selectable setting instead of an accident of "an unassociated STA lands on
+  channel 1." On the WCBs it's set via `?WCBCH,<n>` or the Wizard's **Advanced → Mesh
+  Channel** field, persisted in NVS, and applied on the next reboot. On this library the default is
+  `1`; call `setMeshChannel(ch)` before `begin()` to match a fleet running elsewhere.
+- **Channel awareness in `begin()` / `update()`.** With no hosted SoftAP, `begin()`
+  now pins the radio to the mesh channel deterministically. With a SoftAP active (which
+  owns the single radio's channel), the library instead **warns** — rate-limited and
+  re-checked on every heartbeat — when the radio isn't on the mesh channel, rather than
+  silently failing to reach the mesh. It never force-moves a deliberately chosen SoftAP
+  channel.
 
 ### 1.9.6
 

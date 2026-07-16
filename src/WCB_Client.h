@@ -75,6 +75,11 @@ constexpr uint8_t broadcast = 0;
 // Library limits
 // ─────────────────────────────────────────────────────────────────────────────
 #define WCB_MAX_BOARDS   20   // Maximum WCB IDs supported (1–20)
+#define WCB_MESH_CHANNEL  1   // Default ESP-NOW mesh channel (1–11). The ESP32 has ONE
+                              // radio, so this MUST match the channel every WCB is on or
+                              // this device is silently unreachable. If your fleet runs on
+                              // a non-default channel (set via ?WCBCH / the Wizard), call
+                              // setMeshChannel(ch) before begin() to match it.
 #define WCB_PENDING_MAX  10   // In-flight COMMAND slots tracked for ACK.
                               // Matches the WCB firmware's ETM_PENDING_MAX so
                               // client ensured traffic has the same depth as
@@ -595,6 +600,15 @@ public:
     // Note: enabling checksum reduces the usable command length from 200 to ~188 chars.
     void setChecksum(bool enabled);
 
+    // Set the ESP-NOW mesh channel this device expects the WCBs to be on (1–11).
+    // The ESP32 has one radio, so this device can only hear the mesh if it sits on
+    // the same channel. Best called BEFORE begin() if your fleet runs on a
+    // non-default channel (changed via ?WCBCH / the Wizard). Calling it AFTER
+    // begin() also works when no SoftAP is active — it re-pins the radio live.
+    // With a SoftAP active (which owns the channel) begin() and update() instead
+    // WARN if the radio ends up on the wrong channel. Default: WCB_MESH_CHANNEL (1).
+    void setMeshChannel(uint8_t channel);
+
     // ── Device identity (WDP discovery) ────────────────────────────────────
 
     // Advertise this device's identity on the WCB mesh via WDP so every WCB
@@ -667,6 +681,11 @@ private:
     uint8_t  _missedBeforeOffline  = 3;   // Missed heartbeats before marking offline
 
     bool _checksumEnabled = true;  // CRC32 on/off — must match ?ETM,CHKSM on WCBs
+
+    // ── Mesh channel ─────────────────────────────────────────────────────────
+    uint8_t       _meshChannel       = WCB_MESH_CHANNEL;  // expected ESP-NOW channel (1–13)
+    uint8_t       _lastWarnedChannel = 0;                 // last off-channel value we warned about (0 = none)
+    unsigned long _lastChannelWarnMs = 0;                 // millis() of the last mismatch warning (rate-limit)
 
     // ── WDP device-identity advert ───────────────────────────────────────────
     // Set via setIdentity(); broadcast on the mesh as WCB_PACKET_WDP so WCBs
@@ -741,6 +760,10 @@ private:
 
     // Build and broadcast a HEARTBEAT packet so all WCBs know this device is alive.
     void _sendHeartbeat();
+
+    // Compare the radio's current channel to _meshChannel; emit a rate-limited
+    // warning if they differ (a hosted SoftAP can move the radio off the mesh).
+    void _checkMeshChannel();
 
     // ── WDP device-identity advert helpers ───────────────────────────────────
     // Build the WDP TLV payload (magic + proto + DEVTYPE/FWVER/HWREV/CAPTAGS +

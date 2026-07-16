@@ -111,6 +111,24 @@ bool WCB_Client::begin() {
                        "ESP-NOW sharing the AP's radio channel");
     }
 
+    // ── Mesh channel ─────────────────────────────────────────────────────────
+    // ESP-NOW peers are channel-0 ("current channel"), so this device is only
+    // heard if its radio sits on the mesh channel (_meshChannel, settable via
+    // setMeshChannel()). With no SoftAP we pin it deterministically; with a
+    // SoftAP active the AP owns the channel, so we can't move it without yanking
+    // the AP — we only WARN on a mismatch, and re-check in update() to catch a
+    // SoftAP that's brought up after begin().
+    if (!apActive) {
+        esp_err_t chErr = esp_wifi_set_channel(_meshChannel, WIFI_SECOND_CHAN_NONE);
+        if (chErr != ESP_OK) {
+            Serial.printf("[WCB_Client] WARNING: esp_wifi_set_channel(%u) failed (err %d) - "
+                          "the radio may be on the wrong channel; the mesh uses 1-11.\n",
+                          _meshChannel, chErr);
+        }
+    } else {
+        _checkMeshChannel();
+    }
+
     // ── Build MAC table ──────────────────────────────────────────────────────
     // Must happen BEFORE esp_wifi_set_mac() so _wcbMACs[] is populated.
     _buildMACs();
@@ -194,6 +212,7 @@ void WCB_Client::update() {
     if (now >= _nextHeartbeatMs) {
         _sendHeartbeat();
         _nextHeartbeatMs = now + (_heartbeatIntervalSec * 1000UL);
+        _checkMeshChannel();   // catch a SoftAP that moved the radio off the mesh channel
     }
 
     _checkOfflineBoards();
@@ -834,6 +853,63 @@ bool WCB_Client::sendRawPacket(uint8_t target_wcb, const uint8_t* data, size_t l
 // Enable or disable CRC32 checksum. Must match the WCB network's ?ETM,CHKSM setting.
 void WCB_Client::setChecksum(bool enabled) {
     _checksumEnabled = enabled;
+}
+
+// Set the ESP-NOW mesh channel this device expects (1–13). See the header for the
+// full contract. Out-of-range values are ignored (the current value is kept).
+void WCB_Client::setMeshChannel(uint8_t channel) {
+    if (channel < 1 || channel > 11) {
+        Serial.printf("[WCB_Client] setMeshChannel: %u out of range (1-11), ignored\n", channel);
+        return;
+    }
+    _meshChannel = channel;
+    // If begin() already ran and we own the radio (no SoftAP), re-pin it live so a
+    // runtime change actually takes effect — otherwise this would only update the
+    // expected value while the radio stayed put. With a SoftAP active the AP owns
+    // the channel; we don't move it (update()'s _checkMeshChannel warns instead).
+    if (_started) {
+        wifi_mode_t mode = WiFi.getMode();
+        bool apActive = (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA);
+        if (!apActive) esp_wifi_set_channel(_meshChannel, WIFI_SECOND_CHAN_NONE);
+    }
+}
+
+// Warn (rate-limited) if the radio isn't on the expected mesh channel — this device
+// can't reach the mesh when off-channel, so surface it loudly instead of failing
+// silently. The advice depends on WHY the radio moved: a hosted SoftAP owns the
+// channel (bring the AP up on the mesh channel), otherwise a STA association or a
+// channel change moved it. We only warn (never force) so we don't yank a
+// deliberately-chosen SoftAP channel.
+//
+// NOTE: this can only catch a radio that drifted OFF _meshChannel. It cannot detect
+// a _meshChannel that is itself wrong (the fleet moved via ?WCBCH but this sketch was
+// never updated) — an ESP-NOW device on the wrong channel hears nothing, so it has no
+// way to learn the fleet's real channel. Keep _meshChannel in sync via setMeshChannel().
+void WCB_Client::_checkMeshChannel() {
+    uint8_t primary = 0;
+    wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+    if (esp_wifi_get_channel(&primary, &second) != ESP_OK) return;
+    if (primary == _meshChannel) { _lastWarnedChannel = 0; return; }  // on-channel: reset so a later drift re-warns
+
+    unsigned long now = millis();
+    // Warn on first detection / a change of wrong channel; otherwise throttle to 30s.
+    if (primary == _lastWarnedChannel && (now - _lastChannelWarnMs) < 30000UL) return;
+    _lastWarnedChannel = primary;
+    _lastChannelWarnMs = now;
+    wifi_mode_t mode = WiFi.getMode();
+    bool apActive = (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA);
+    if (apActive) {
+        Serial.printf("[WCB_Client] WARNING: radio is on channel %u but the WCB mesh is on "
+                      "channel %u - this device will NOT reach the mesh. A hosted SoftAP owns "
+                      "the radio channel; bring the AP up on the mesh channel: "
+                      "WiFi.softAP(ssid, pass, %u).\n",
+                      primary, _meshChannel, _meshChannel);
+    } else {
+        Serial.printf("[WCB_Client] WARNING: radio is on channel %u but the WCB mesh is on "
+                      "channel %u - this device will NOT reach the mesh. A WiFi STA association "
+                      "or a channel change may have moved it; call setMeshChannel(%u) or reboot.\n",
+                      primary, _meshChannel, _meshChannel);
+    }
 }
 
 // =============================================================================
