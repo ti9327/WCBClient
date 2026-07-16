@@ -44,16 +44,30 @@ This library lets any ESP32 — a Kyber controller, a custom prop brain, a stage
 This library takes over the ESP32's radio to join the WCB ESP-NOW network. Read
 this before combining it with WiFi or another ESP-NOW stack.
 
-### It takes over WiFi
+### It takes over WiFi (STA) — but a SoftAP can coexist
 
-`begin()` calls `WiFi.mode(WIFI_STA)` followed by `WiFi.disconnect()`. **It will
-drop any existing connection to a WiFi router/AP**, and ESP-NOW timing assumes no
-AP association. You generally **cannot run a normal WiFi workload (web server,
-MQTT, cloud, HTTP/OTA-over-WiFi) on the same ESP32** while using this library.
+`begin()` puts WiFi into station mode and calls `WiFi.disconnect()`. **It will
+drop any existing STA connection to a WiFi router**, and ESP-NOW timing assumes
+no STA association. You generally **cannot associate this ESP32 with an
+external WiFi router** while using this library — connecting to someone else's
+AP hands channel control to that AP, and ESP-NOW only works if every WCB
+happens to already be on that channel too (see below).
 
-If you genuinely need both, you must keep everything on a **single fixed WiFi
-channel** (see below) and accept the MAC override — in practice it's far simpler
-to dedicate this ESP32 to the WCB network and use a second board for WiFi tasks.
+**Hosting your own SoftAP is a different story and is supported.** If you call
+`WiFi.softAP(ssid, password, channel)` *before* `begin()`, the library detects
+it and switches to `WIFI_AP_STA` instead of `WIFI_STA` — your AP (and any web
+server built on it) stays up, and ESP-NOW simply rides the AP's radio channel
+(AP and STA share a single channel on the ESP32, so there's no separate
+negotiation). Calling `softAP()` *after* `begin()` also works, since
+`WiFi.mode()` ORs in `WIFI_AP` without dropping STA. Either way, all WCBs and
+clients still need to end up on the AP's channel — pick it deliberately rather
+than leaving it to default to channel 1.
+
+If you need to *associate* with an external router (not host your own AP)
+alongside WCB traffic, that's still unsupported without keeping everything on
+a **single fixed WiFi channel** (see below) and accepting the MAC override —
+in practice it's far simpler to dedicate this ESP32 to the WCB network and use
+a second board for that WiFi workload.
 
 ### Shared radio channel
 
@@ -97,7 +111,8 @@ miss ESP-NOW packets. Disable it with `esp_wifi_set_ps(WIFI_PS_NONE)` (or
 | If you need… | Result with this library |
 |---|---|
 | WCB ESP-NOW only | ✅ Intended use — works out of the box |
-| WiFi STA + WCB on the same board | ⚠️ Only if all peers share the AP's fixed channel; `begin()` still disconnects WiFi |
+| SoftAP (hosted web UI) + WCB on the same board | ✅ Supported — `begin()` preserves an existing/later SoftAP as `WIFI_AP_STA`; pick the AP's channel deliberately |
+| WiFi STA (associating with an external router) + WCB on the same board | ⚠️ Only if all peers share the router's fixed channel; `begin()` still disconnects STA |
 | A second, separate ESP-NOW network | ❌ Not supported — single global receive callback |
 | Multiple `WCB_Client` objects | ❌ Not supported — singleton |
 | Factory MAC preserved | ❌ MAC is overwritten by design |
